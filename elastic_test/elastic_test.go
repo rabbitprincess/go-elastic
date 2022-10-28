@@ -2,10 +2,11 @@ package elastic_test
 
 import (
 	"fmt"
-	"go-elasticsearch-example/elastic"
 	"log"
 	"testing"
 	"time"
+
+	"github.com/gokch/go-elastic/elastic"
 
 	doc "github.com/aergoio/aergo-indexer/indexer/documents"
 )
@@ -41,7 +42,7 @@ func Test_elastic_createIndex(t *testing.T) {
 	}
 
 	// create index ( tx )
-	err = client.CreateIndex("chain_2022-10-19_06-44-43_tx", "tx")
+	err = client.CreateIndex("tx", "tx")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,6 +70,20 @@ func Test_elastic_createIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func Test_elastic_getIndex(t *testing.T) {
+	client, err := InitClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// update alias ( tx )
+	err = client.UpdateAlias("tx_alias", "tx")
+	if err != nil {
+		t.Fatal(err)
+	}
+
 }
 
 func Test_elastic_insert(t *testing.T) {

@@ -32,7 +32,6 @@ func HandleResp(res *esapi.Response, err error, v interface{}) error {
 		if err != nil {
 			return err
 		}
-		fmt.Println(string(body))
 		err = json.Unmarshal(body, v)
 		if err != nil {
 			return err

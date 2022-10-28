@@ -7,15 +7,16 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	doc "github.com/aergoio/aergo-indexer/indexer/documents"
 	es "github.com/elastic/go-elasticsearch/v8"
 	"github.com/elastic/go-elasticsearch/v8/esapi"
+	"github.com/elastic/go-elasticsearch/v8/esutil"
 )
 
 var (
@@ -149,136 +150,72 @@ func (e *ElasticsearchDbController2) Insert(doc doc.DocType, params UpdateParams
 	return 1, nil
 }
 
-// InsertBulk inserts documents arriving in documentChannel in bulk using the updata params
-// It returns the number of inserted documents or an error
-func (esdb *ElasticsearchDbController2) InsertBulk(documentChannel chan doc.DocType, params UpdateParams) (uint64, error) {
+func (e *ElasticsearchDbController2) InsertBulk(documentChannel chan doc.DocType, params UpdateParams) (uint64, error) {
 	ctx := context.Background()
-	var total uint64
-	bulk := &BulkService{
-		index:  params.IndexName,
-		client: esdb.Client,
+
+	bulkIndexer, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
+		Client: e.Client,
+		Index:  params.IndexName,
+		// NumWorkers: 10, // the number of worker goroutines ( default : number of CPUs )
+		// FlushBytes: 5e+6, // The flush threshold in bytes (default: 5M)
+	})
+	if err != nil {
+		return 0, err
 	}
 
-	begin := time.Now()
-	commitBulk := func() error {
-		res, err := bulk.Do(ctx)
-		if err != nil {
-			return err
-		}
-		dur := time.Since(begin).Seconds()
-		pps := int64(float64(total) / dur)
-		logger.Info().Int("chunkSize", params.Size).Uint64("total", total).Int64("perSecond", pps).Str("indexName", params.IndexName).Msg("Comitted bulk chunk")
-		if err == nil {
-			err = getFirstError(res)
-		}
-		if err != nil {
-			return err
-		}
-		return nil
+	var Action string
+	if params.Upsert == true {
+		Action = "update"
+	} else {
+		Action = "create"
 	}
+
 	for d := range documentChannel {
-		atomic.AddUint64(&total, 1)
-		if params.Upsert {
-			bulk.Add(NewBulkUpdateRequest().Id(d.GetID()).Doc(d).DocAsUpsert(true))
-		} else {
-			bulk.Add(NewBulkUpdateRequest().Id(d.GetID()).Doc(d).DocAsUpsert(true))
+		body, err := json.Marshal(d)
+		if err != nil {
+			return 0, err
 		}
-		if bulk.NumberOfActions() >= params.Size {
-			err := commitBulk()
-			if err != nil {
-				return total, err
-			}
+
+		if err = bulkIndexer.Add(ctx, esutil.BulkIndexerItem{
+			Action:     Action,                // Action field configures the operation to perform (index, create, delete, update)
+			DocumentID: d.GetID(),             // DocumentID is the optional document ID
+			Body:       bytes.NewReader(body), // Body is an `io.Reader` with the payload
+			OnSuccess: func(ctx context.Context, item esutil.BulkIndexerItem, res esutil.BulkIndexerResponseItem) {
+				fmt.Printf("[%d] %s test/%s", res.Status, res.Result, item.DocumentID)
+			},
+			OnFailure: func(ctx context.Context, item esutil.BulkIndexerItem, res esutil.BulkIndexerResponseItem, err error) {
+				log.Printf("ERROR: %s | %s: %s\n", err, res.Error.Type, res.Error.Reason)
+			},
+		}); err != nil {
+			return 0, err
 		}
 
 		select {
 		default:
 		case <-ctx.Done():
+			stats := bulkIndexer.Stats()
+			if stats.NumFailed > 0 {
+				return 0, fmt.Errorf("Indexed [%d] documents with [%d] errors", stats.NumFlushed, stats.NumFailed)
+			}
+			total := stats.NumAdded + stats.NumUpdated
 			return total, ctx.Err()
 		}
 	}
 
-	// Commit the final batch before exiting
-	if bulk.NumberOfActions() > 0 {
-		err := commitBulk()
-		if err != nil {
-			return total, err
-		}
+	err = bulkIndexer.Close(ctx)
+	if err != nil {
+		return 0, err
 	}
+
+	// Report the indexer statistics
+	stats := bulkIndexer.Stats()
+	if stats.NumFailed > 0 {
+		return 0, fmt.Errorf("Indexed [%d] documents with [%d] errors", stats.NumFlushed, stats.NumFailed)
+	}
+	total := stats.NumAdded + stats.NumUpdated
 	return total, nil
 }
 
-func getFirstError(res *BulkResponse) error {
-	if res.Errors {
-		for _, v := range res.Items {
-			for action, item := range v {
-				if item.Error != nil {
-					resJSON, _ := json.Marshal(item.Error)
-					return fmt.Errorf("%s %s (%s): %s", action, item.Type, item.Id, string(resJSON))
-				}
-			}
-		}
-	}
-	return nil
-}
-
-/*
-	func (e *ElasticsearchDbController2) InsertBulk(documentChannel chan doc.DocType, params UpdateParams) (uint64, error) {
-		ctx := context.Background()
-
-		bulkIndexer, err := NewBulkIndexer(BulkIndexerConfig{
-			Client: e.Client,
-			Index:  params.IndexName,
-			// NumWorkers: 10, // the number of worker goroutines ( default : number of CPUs )
-			// FlushBytes: 5e+6, // The flush threshold in bytes (default: 5M)
-		})
-		if err != nil {
-			return 0, err
-		}
-
-		var Action string
-		if params.Upsert == true {
-			Action = "update"
-		} else {
-			Action = "create"
-		}
-
-		// 임시 - batch size 가 너무 크면 터지지 않는지 테스트 해봐야됨 ( 원래 코드는 batch size 직접 처리한 듯 )
-		// 찾아보니까 go elastic lib 내에서 동일한 액션을 취하고 있는듯 ( channel 및 고루틴 등.. 현 버전이 더 성능이 좋을 것 같음.. 테스트 및 상의 필요 )
-		for d := range documentChannel {
-			body, err := json.Marshal(d)
-			if err != nil {
-				return 0, err
-			}
-
-			if err = bulkIndexer.Add(ctx, BulkIndexerItem{
-				Action:     Action,                // Action field configures the operation to perform (index, create, delete, update)
-				DocumentID: d.GetID(),             // DocumentID is the optional document ID
-				Body:       bytes.NewReader(body), // Body is an `io.Reader` with the payload
-				OnSuccess: func(ctx context.Context, item BulkIndexerItem, res BulkIndexerResponseItem) {
-					fmt.Printf("[%d] %s test/%s", res.Status, res.Result, item.DocumentID)
-				},
-				OnFailure: func(ctx context.Context, item BulkIndexerItem, res BulkIndexerResponseItem, err error) {
-					log.Printf("ERROR: %s | %s: %s\n", err, res.Error.Type, res.Error.Reason)
-				},
-			}); err != nil {
-				return 0, err
-			}
-		}
-
-		err = bulkIndexer.Close(ctx)
-		if err != nil {
-			return 0, err
-		}
-
-		// Report the indexer statistics
-		stats := bulkIndexer.Stats()
-		if stats.NumFailed > 0 {
-			return 0, fmt.Errorf("Indexed [%d] documents with [%d] errors", stats.NumFlushed, stats.NumFailed)
-		}
-		total := stats.NumAdded + stats.NumUpdated
-		return total, nil
-	}
-*/
 func (e *ElasticsearchDbController2) Delete(params QueryParams) (uint64, error) {
 	// make query where ( between )
 	var query bytes.Buffer

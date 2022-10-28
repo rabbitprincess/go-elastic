@@ -1,8 +1,9 @@
 package main
 
 import (
-	"go-elasticsearch-example/elastic"
 	"log"
+
+	"github.com/gokch/go-elastic/elastic"
 )
 
 func main() {
